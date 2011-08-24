@@ -11,7 +11,7 @@ start_link(Port) ->
 
 
 init(Parent, Port) ->
-    case gen_tcp:listen(Port, ?TCP_OPTIONS) of
+    case gen_tcp:listen(Port, [{reuseaddr, true} | ?TCP_OPTIONS]) of
         {ok, Socket} -> 
             proc_lib:init_ack(Parent, {ok, self()}),
             loop(Port, Socket);

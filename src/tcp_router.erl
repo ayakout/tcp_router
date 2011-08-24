@@ -9,6 +9,7 @@ start(normal, []) ->
     ets:new(tcp_app_routes, [public, named_table]),
     ets:new(tcp_route_backends, [public, named_table]),
     ets:insert(tcp_app_routes, {next_port, ?INITIAL_ROUTE - 1}),
+    ets:insert(tcp_app_routes, {free_ports, []}),
     inets:start(httpd, instance(?MODULE_STRING, ?ROUTER_PORT, [{all}])),
     tcp_proc_sup:start_link().
 

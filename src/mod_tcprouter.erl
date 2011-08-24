@@ -1,6 +1,8 @@
+%% @todo Change Backend and route to records {ip, port, lastused} and {id, port, proc}
 -module(mod_tcprouter).
 -export([do/1]).
 -include_lib("inets/src/http_server/httpd.hrl").
+-define(MAX_PORT, 65535).
 
 
 %% @doc Inets handler function
@@ -80,7 +82,7 @@ handle_post(Info) ->
     Route = list_to_integer(proplists:get_value(routes, Params)),
     BackendId = list_to_integer(proplists:get_value(backends, Params)),
     [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    Port = proplists:get_value(Route, Ports),
+    {Route, Port, _} = lists:keyfind(Route, 1, Ports),
     [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
     ets:insert(tcp_route_backends, {Port, lists:keyreplace(BackendId, 1, Backends, {BackendId, Body, 0})}).
 
@@ -89,13 +91,18 @@ handle_delete(["routes", Id], Info) ->
     Params = parse_query(Info#mod.request_uri),
     App = list_to_integer(proplists:get_value(apps, Params)),
     [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    ets:insert(tcp_app_routes, {App, proplists:delete(list_to_integer(Id), Ports)});
+    IdInt = list_to_integer(Id),
+    {value, {IdInt, Port, Pid}, NewPorts} = lists:keytake(IdInt, 1, Ports),
+    true = exit(Pid, shutdown), %% @todo Add stop API in tcp_proc
+    ets:insert(tcp_app_routes, {App, NewPorts}),
+    [{free_ports, FreePorts}] = ets:lookup(tcp_app_routes, free_ports),
+    ets:insert(tcp_app_routes, {free_ports, [Port | FreePorts]});
 handle_delete(["backends", Id], Info) ->
     Params = parse_query(Info#mod.request_uri),
     App = list_to_integer(proplists:get_value(apps, Params)),
     Route = list_to_integer(proplists:get_value(routes, Params)),
     [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    Port = proplists:get_value(Route, Ports),
+    {Route, Port, _} = lists:keyfind(Route, 1, Ports),
     [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
     ets:insert(tcp_route_backends, {Port, lists:keydelete(list_to_integer(Id), 1, Backends)});
 handle_delete(_, _) ->
@@ -136,16 +143,16 @@ create_route(Params) ->
     App = list_to_integer(proplists:get_value(apps, Params)),
     Port = next_port(),
     io:format("Creating new route ~p for ~p~n", [Port, App]),    
+    {ok, Pid} = tcp_proc_sup:start_proc(Port),
     PortId = case ets:lookup(tcp_app_routes, App) of
                  [] -> 
-                     ets:insert(tcp_app_routes, {App, [{1, Port}]}),
+                     ets:insert(tcp_app_routes, {App, [{1, Port, Pid}]}),
                      1;
-                 [{App, [{Id, _} | _] = Ports}] ->
-                     ets:insert(tcp_app_routes, {App, [{Id + 1, Port} | Ports]}),
+                 [{App, [{Id, _, _} | _] = Ports}] ->
+                     ets:insert(tcp_app_routes, {App, [{Id + 1, Port, Pid} | Ports]}),
                      Id + 1
              end,
     ets:insert(tcp_route_backends, {Port, []}),
-    tcp_proc_sup:start_proc(Port),
     lists:concat([" -> {Id: ", PortId, ", url: tcp://localhost:", Port, "}\n"]). 
 
 
@@ -156,7 +163,7 @@ add_backend(Params, Body) ->
         [] -> "Not Found";
         [{_App, Routes}] ->
             Route = list_to_integer(proplists:get_value(routes, Params)),
-            Port = proplists:get_value(Route, Routes),
+            {Route, Port, _} = lists:keyfind(Route, 1, Routes),
             io:format("Adding Backend ~p for route ~p port: ~p~n", [Body, Route, Port]),
             case ets:lookup(tcp_route_backends, Port) of
                 [] -> ok;
@@ -171,7 +178,20 @@ add_backend(Params, Body) ->
 
 %% @doc Retrieve the next available port in sequence and increments the index
 next_port() ->
-    ets:update_counter(tcp_app_routes, next_port, 1).
+    [{free_ports, FreePorts}] = ets:lookup(tcp_app_routes, free_ports),
+    case FreePorts of
+        [] ->
+            Port = ets:update_counter(tcp_app_routes, next_port, 1),
+            if 
+                Port > ?MAX_PORT -> 
+                    throw(no_ports_available);
+                true -> 
+                    Port
+            end;
+        [Port | Rest] ->
+            ets:insert(tcp_app_routes, {free_ports, Rest}),
+            Port
+    end.
     
 
 %% @doc Parse the URI into a tagged list        
