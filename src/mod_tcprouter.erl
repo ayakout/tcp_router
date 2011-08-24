@@ -82,7 +82,7 @@ handle_post(Info) ->
     [{App, Ports}] = ets:lookup(tcp_app_routes, App),
     Port = proplists:get_value(Route, Ports),
     [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
-    ets:insert(tcp_route_backends, {Port, lists:keyreplace(BackendId, 1, Backends, {BackendId, Body})}).
+    ets:insert(tcp_route_backends, {Port, lists:keyreplace(BackendId, 1, Backends, {BackendId, Body, 0})}).
 
 
 handle_delete(["routes", Id], Info) ->
@@ -97,7 +97,7 @@ handle_delete(["backends", Id], Info) ->
     [{App, Ports}] = ets:lookup(tcp_app_routes, App),
     Port = proplists:get_value(Route, Ports),
     [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
-    ets:insert(tcp_route_backends, {Port, proplists:delete(list_to_integer(Id), Backends)});
+    ets:insert(tcp_route_backends, {Port, lists:keydelete(list_to_integer(Id), 1, Backends)});
 handle_delete(_, _) ->
     [].
     
@@ -111,7 +111,7 @@ handle_get("routes", Info) ->
                 [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
                 [lists:concat([" -> {id: ", Id, ", url: tcp://localhost:", Port, 
                               ", backends: ", lists:flatten(io_lib:format("~p", [Backend])), "}\n"])
-                 || {_, Backend} <- Backends]
+                 || {_, Backend, _} <- Backends]
         end,
     lists:map(F, Ports);
 handle_get(_, _) ->
@@ -145,7 +145,7 @@ create_route(Params) ->
                      Id + 1
              end,
     ets:insert(tcp_route_backends, {Port, []}),
-    tcp_proc:start_link(Port),
+    tcp_proc_sup:start_proc(Port),
     lists:concat([" -> {Id: ", PortId, ", url: tcp://localhost:", Port, "}\n"]). 
 
 
@@ -161,9 +161,9 @@ add_backend(Params, Body) ->
             case ets:lookup(tcp_route_backends, Port) of
                 [] -> ok;
                 [{Port, Backends}] when Backends == [] ->
-                    ets:insert(tcp_route_backends, {Port, [{1, Body}]});
-                [{Port, [{Id, _} | _] = Backends}] ->
-                    ets:insert(tcp_route_backends, {Port, [{Id + 1, Body} | Backends]})
+                    ets:insert(tcp_route_backends, {Port, [{1, Body, 0}]});
+                [{Port, [{Id, _, _} | _] = Backends}] ->
+                    ets:insert(tcp_route_backends, {Port, [{Id + 1, Body, 0} | Backends]})
             end,
             lists:concat([" -> {Id: ", Route, "}\n"])
     end.
