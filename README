@@ -1,0 +1,44 @@
+# Erlang TCP router
+
+## REST API
+
+### Create a route
+
+    curl -XPUT http://localhost:8001/apps/123/routes
+     -> '{"id": 1, "url": "tcp://localhost:10000/"}'
+
+### Attach a backend to a route
+
+    curl -XPUT -d '{"ip": "127.0.0.1", "port": 9999}' http://localhost:8001/apps/123/routes/1/backends
+     -> '{"id": 1}'
+
+### Detach a backend from a route
+
+    curl -XDELETE http://localhost:8001/apps/123/routes/1/backends/1
+
+### Update a backend attached to a route
+
+    curl -XPOST -d '{"ip": "127.0.0.1", "port": 8888}' http://localhost:8001/apps/123/routes/1/backends/1
+
+### Get routes
+
+    curl -XGET http://localhost:8001/apps/123/routes
+     -> '{"id": 1, "url": "tcp://localhost:10000/", "backends": [{"ip": "127.0.0.1", "port": 8888}]}'
+
+### Destroy a route
+
+    curl -XDELETE http://localhost:8001/apps/123/routes/1
+
+## Example
+
+    $ curl -XPUT http://localhost:8001/apps/123/routes
+    {"id": 1, "url": "tcp://localhost:10000/"}
+    $ curl -XPUT -d '{"ip": "127.0.0.1", "port": 8888}' http://localhost:8001/apps/123/routes/1/backends
+    {"id": 1}
+    $ ncat -l -p 8888
+
+    * separate tab *
+    $ telnet 127.0.0.1 10000
+    Trying 127.0.0.1...
+    Connected to localhost.
+    Escape character is '^]'.
