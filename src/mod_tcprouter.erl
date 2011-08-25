@@ -3,7 +3,7 @@
 -export([do/1]).
 -include_lib("inets/src/http_server/httpd.hrl").
 -define(MAX_PORT, 65535).
-
+-include("tcp_router.hrl").
 
 %% @doc Inets handler function
 do(#mod{method = "PUT"} = Info) ->
@@ -66,12 +66,12 @@ do(Info) ->
     Info.
 
 
-%% @doc Returns dummy response
+%% @doc Proceed with the response
 proceed(Info, Data) ->
     io:format("~s: ~p ~n", [?MODULE, Info#mod.request_uri]),
     Head=[{content_type, "text/xml"},
           {content_length, integer_to_list(httpd_util:flatlength(Data))},
-          {code, 401}],
+          {code, 200}],
     {proceed, [{response,{response, Head, Data}} | Info#mod.data]}.
 
 
@@ -79,32 +79,24 @@ handle_post(Info) ->
     Params = parse_query(Info#mod.request_uri),
     Body = parse_body(Info#mod.entity_body),
     App = list_to_integer(proplists:get_value(apps, Params)),
-    Route = list_to_integer(proplists:get_value(routes, Params)),
+    RouteId = list_to_integer(proplists:get_value(routes, Params)),
     BackendId = list_to_integer(proplists:get_value(backends, Params)),
-    [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    {Route, Port, _} = lists:keyfind(Route, 1, Ports),
-    [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
-    ets:insert(tcp_route_backends, {Port, lists:keyreplace(BackendId, 1, Backends, {BackendId, Body, 0})}).
+    [AppRoute] = mnesia:dirty_match_object({app_route, App, RouteId, '_', '_'}),
+    [RouteBackend] = mnesia:dirty_match_object({route_backend, AppRoute#app_route.route, 
+                                                BackendId, '_', '_', '_'}),
+    %% @todo transaction
+    mnesia:dirty_delete_object(route_backend, RouteBackend),
+    mnesia:dirty_write(RouteBackend#route_backend{ip = proplists:get_value(ip, Body),
+                                                  port = proplists:get_value(port, Body),
+                                                  lastused = 0}).
 
 
 handle_delete(["routes", Id], Info) ->
     Params = parse_query(Info#mod.request_uri),
-    App = list_to_integer(proplists:get_value(apps, Params)),
-    [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    IdInt = list_to_integer(Id),
-    {value, {IdInt, Port, Pid}, NewPorts} = lists:keytake(IdInt, 1, Ports),
-    true = exit(Pid, shutdown), %% @todo Add stop API in tcp_proc
-    ets:insert(tcp_app_routes, {App, NewPorts}),
-    [{free_ports, FreePorts}] = ets:lookup(tcp_app_routes, free_ports),
-    ets:insert(tcp_app_routes, {free_ports, [Port | FreePorts]});
+    delete_route(Id, Params);
 handle_delete(["backends", Id], Info) ->
     Params = parse_query(Info#mod.request_uri),
-    App = list_to_integer(proplists:get_value(apps, Params)),
-    Route = list_to_integer(proplists:get_value(routes, Params)),
-    [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    {Route, Port, _} = lists:keyfind(Route, 1, Ports),
-    [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
-    ets:insert(tcp_route_backends, {Port, lists:keydelete(list_to_integer(Id), 1, Backends)});
+    delete_backend(Id, Params);
 handle_delete(_, _) ->
     [].
     
@@ -113,14 +105,14 @@ handle_delete(_, _) ->
 handle_get("routes", Info) ->
     Params = parse_query(Info#mod.request_uri),
     App = list_to_integer(proplists:get_value(apps, Params)),
-    [{App, Ports}] = ets:lookup(tcp_app_routes, App),
-    F = fun({Id, Port}) ->
-                [{Port, Backends}] = ets:lookup(tcp_route_backends, Port),
-                [lists:concat([" -> {id: ", Id, ", url: tcp://localhost:", Port, 
-                              ", backends: ", lists:flatten(io_lib:format("~p", [Backend])), "}\n"])
-                 || {_, Backend, _} <- Backends]
+    AppRoutes = mnesia:dirty_read(app_route, App),
+    F = fun(#app_route{id = Id, route = Route}) ->
+                RouteBackends = mnesia:dirty_read(route_backend, Route),
+                [lists:concat([" -> {id: ", Id, ", url: tcp://localhost:", Route, 
+                              ", backends: [{ip: ", B#route_backend.ip, ", port: ", B#route_backend.port, "}]}\n"])
+                 || B <- RouteBackends]
         end,
-    lists:map(F, Ports);
+    lists:map(F, AppRoutes);
 handle_get(_, _) ->
     [].
 
@@ -144,38 +136,59 @@ create_route(Params) ->
     Port = next_port(),
     io:format("Creating new route ~p for ~p~n", [Port, App]),    
     {ok, Pid} = tcp_proc_sup:start_proc(Port),
-    PortId = case ets:lookup(tcp_app_routes, App) of
-                 [] -> 
-                     ets:insert(tcp_app_routes, {App, [{1, Port, Pid}]}),
-                     1;
-                 [{App, [{Id, _, _} | _] = Ports}] ->
-                     ets:insert(tcp_app_routes, {App, [{Id + 1, Port, Pid} | Ports]}),
-                     Id + 1
+    %% @todo transaction
+    PortId = case mnesia:dirty_read(app_route, App) of
+                 [] -> 1;
+                 AppRoutes ->
+                     LastAppRoute = lists:last(lists:keysort(#app_route.id, AppRoutes)),
+                     LastAppRoute#app_route.id + 1
              end,
-    ets:insert(tcp_route_backends, {Port, []}),
+    mnesia:dirty_write(#app_route{app = App, id = PortId, route = Port, proc = Pid}),
     lists:concat([" -> {Id: ", PortId, ", url: tcp://localhost:", Port, "}\n"]). 
 
+
+delete_route(Id, Params) ->
+    App = list_to_integer(proplists:get_value(apps, Params)),
+    IdInt = list_to_integer(Id),
+    [AppRoute] = mnesia:dirty_match_object({app_route, App, IdInt, '_', '_'}),
+    mnesia:dirty_delete_object(app_route, AppRoute),
+    true = exit(AppRoute#app_route.proc, shutdown), %% @todo Add stop API in tcp_proc
+    [{free_ports, FreePorts}] = ets:lookup(tcp_app_routes, free_ports),
+    ets:insert(tcp_app_routes, {free_ports, [AppRoute#app_route.route | FreePorts]}).
+    
 
 %% @doc Add a backend to the application route
 add_backend(Params, Body) ->
     App = list_to_integer(proplists:get_value(apps, Params)),
-    case ets:lookup(tcp_app_routes, App) of
-        [] -> "Not Found";
-        [{_App, Routes}] ->
-            Route = list_to_integer(proplists:get_value(routes, Params)),
-            {Route, Port, _} = lists:keyfind(Route, 1, Routes),
-            io:format("Adding Backend ~p for route ~p port: ~p~n", [Body, Route, Port]),
-            case ets:lookup(tcp_route_backends, Port) of
-                [] -> ok;
-                [{Port, Backends}] when Backends == [] ->
-                    ets:insert(tcp_route_backends, {Port, [{1, Body, 0}]});
-                [{Port, [{Id, _, _} | _] = Backends}] ->
-                    ets:insert(tcp_route_backends, {Port, [{Id + 1, Body, 0} | Backends]})
-            end,
-            lists:concat([" -> {Id: ", Route, "}\n"])
+    RouteId = list_to_integer(proplists:get_value(routes, Params)),
+    case mnesia:dirty_match_object({app_route, App, RouteId, '_', '_'}) of
+        [] -> [];
+        [AppRoute] ->
+            #app_route{route = Route} = AppRoute,
+            BackendId = case mnesia:dirty_read(route_backend, Route) of
+                            [] -> 
+                                1;
+                            RouteBackends ->
+                                LastRouteBackend = lists:last(lists:keysort(#route_backend.id, RouteBackends)),
+                                LastRouteBackend#route_backend.id + 1
+                        end,
+            io:format("Adding Backend~p for route ~p port: ~p~n", [Body, RouteId, Route]),
+            mnesia:dirty_write(#route_backend{route = Route, id = BackendId, 
+                                              ip = proplists:get_value(ip, Body),
+                                              port = proplists:get_value(port, Body)}),
+            lists:concat([" -> {Id: ", RouteId, "}\n"])
     end.
 
 
+delete_backend(Id, Params) ->
+    App = list_to_integer(proplists:get_value(apps, Params)),
+    RouteId = list_to_integer(proplists:get_value(routes, Params)),
+    [AppRoute] = mnesia:dirty_match_object({app_route, App, RouteId, '_', '_'}),
+    [RouteBackend] = mnesia:dirty_match_object({route_backend, AppRoute#app_route.route, 
+                                                list_to_integer(Id), '_', '_', '_'}),
+    mnesia:dirty_delete_object(route_backend, RouteBackend).
+        
+    
 %% @doc Retrieve the next available port in sequence and increments the index
 next_port() ->
     [{free_ports, FreePorts}] = ets:lookup(tcp_app_routes, free_ports),
